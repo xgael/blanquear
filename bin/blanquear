@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# blanquear — quita metadatos de archivos (EXIF/GPS, autor, software, fechas internas,
+# atributos extendidos de macOS) y verifica con exiftool que no quede nada sensible.
+#
+#   blanquear [--en-sitio] [--ligero] RUTA...
+#
+#   (por defecto)  archivo  → copia limpia junto al original: foto.jpg → foto.cleaned.jpg
+#                  carpeta  → «Carpeta (blanqueada)» al lado, misma estructura y nombres;
+#                             lo que no se pudo limpiar NO entra en ella (se lista)
+#   --en-sitio     sobrescribe el original (sin copia de respaldo)
+#   --ligero       PDF: conserva el texto seleccionable (el modo completo convierte
+#                  cada página en imagen, que es lo único que garantiza PDF vacío)
+#
+# El tipo se detecta por CONTENIDO, no por la terminación. Motores: exiftool (fotos, sin
+# re-codificar; MOV/MP4 sin re-empaquetar), mat2 (documentos, PDF, audio), ffmpeg (el resto
+# de audio/video, sin re-codificar), firmas del codificador en los bytes, exiftool
+# (lo demás que sepa escribir). Si ningún motor escribe el formato, se copia tal cual sólo
+# si la verificación no le halla metadatos (◦); si le halla, no se entrega (⚠).
+# Nunca se da por limpio sin medir.
+set -uo pipefail
+export LC_ALL=C  # se procesan bytes binarios; con UTF-8, sed/grep fallan con «illegal byte sequence»
+
+ENSITIO=0; LIGERO=0; RUTAS=()
+for a in "$@"; do
+  case "$a" in
+    --en-sitio) ENSITIO=1 ;;
+    --ligero)   LIGERO=1 ;;
+    -h|--help)  sed -n '2,18p' "$0"; exit 0 ;;
+    *)          RUTAS+=("$a") ;;
+  esac
+done
+[ ${#RUTAS[@]} -eq 0 ] && { sed -n '2,18p' "$0"; exit 1; }
+for t in mat2 exiftool ffmpeg; do
+  command -v $t >/dev/null || { echo "falta $t: brew install $t" >&2; exit 1; }
+done
+
+# Etiquetas que delatan origen/persona/lugar. Las estructurales (ancho, códec…) no cuentan.
+SENSIBLES=(-GPS:all -Make -Model -SerialNumber -InternalSerialNumber -LensModel -LensSerialNumber
+  -Artist -Author -Creator -Producer -CreatorTool -Software -LastModifiedBy -Company -Manager
+  -Copyright -OwnerName -CameraOwnerName -Title -Subject -Keywords -Comment -UserComment
+  -ImageDescription -Description -HostComputer -DateTimeOriginal -CreateDate -ModifyDate
+  -MetadataDate -GPSCoordinates -LocationInformation -Encoder -AndroidVersion -ContentIdentifier)
+
+ok=0; mal=0; crudo=0
+TRABAJO=$(mktemp -d); trap 'rm -rf "$TRABAJO"' EXIT
+
+# Firmas del codificador DENTRO del audio/video, que mat2, exiftool y ffmpeg -map_metadata
+# no tocan. Se cambian por relleno del mismo largo (ninguna caja ni frame cambia de tamaño)
+# y la verificación exige audio/video decodificado idéntico.
+#  · MP3: la cabecera LAME (frame «Info»/«Xing») guarda la versión («Lavc63.1.», «LAME3.100»).
+#    Las 4 letras se quedan: los decodificadores las leen para recortar el silencio del inicio
+#    (CoreAudio sólo con «LAME»). Se pone en ceros la versión y se recalcula el CRC si era válido.
+#    Va PRIMERO: si no, la regla de abajo convertiría «LAME3.100» en «UUUU…».
+#  · libmp3lame firma «LAME4.0» en el relleno de los frames; el AAC de ffmpeg, «Lavc63.1.102»
+#    en un bloque auxiliar; x264/x265 sus opciones en un SEI del video. Nadie los lee al decodificar.
+#  · MOV/MP4: en la caja moov, el fabricante «FFMP», el nombre del compresor y los
+#    «VideoHandler»/«SoundHandler» que pone ffmpeg.
+neutralizar_firmas() {
+  python3 -I - "$1" <<'PY2'
+import re, sys
+def crc16(d):
+    c = 0
+    for x in d:
+        c ^= x
+        for _ in range(8):
+            c = (c >> 1) ^ 0xA001 if c & 1 else c >> 1
+    return c
+p = sys.argv[1]; b = bytearray(open(p, 'rb').read())
+
+k = max(b.find(b'Info', 0, 400), b.find(b'Xing', 0, 400))
+fs = next((i for i in range(k) if b[i] == 0xFF and b[i+1] & 0xE0 == 0xE0), None) if k > 0 else None
+if fs is not None:
+    fl = int.from_bytes(b[k+4:k+8], 'big')
+    off = k + 8 + 4*bool(fl & 1) + 4*bool(fl & 2) + 100*bool(fl & 4) + 4*bool(fl & 8)
+    if b[off:off+4] in (b'Lavf', b'Lavc', b'LAME') and any(b[off+4:off+9]):
+        c = off + 34
+        valido = int.from_bytes(b[c:c+2], 'big') == crc16(b[fs:c])
+        b[off+4:off+9] = bytes(5)
+        if valido: b[c:c+2] = crc16(b[fs:c]).to_bytes(2, 'big')
+
+relleno = lambda ch: (lambda m: ch * len(m.group()))
+b[:] = re.sub(rb'LAME[0-9][0-9.a-z]*', relleno(b'U'), bytes(b))
+b[:] = re.sub(rb'Lav[fc][0-9]+\.[0-9]+\.[0-9]+( lib[a-z0-9_]+)?', relleno(b' '), bytes(b))
+# sólo texto imprimible que termina en NUL (x264) o en el bit de parada 0x80 (x265): si el patrón no cierra así, no se toca (y la
+# verificación lo reporta) para no comerse estructura del contenedor
+b[:] = re.sub(rb'x26[45] (- core|\(build) [\x20-\x7e]*(?=[\x00\x80])', relleno(b' '), bytes(b))
+
+i = 0  # cajas de primer nivel MOV/MP4: sólo dentro de moov (nunca en los datos de mdat)
+while i + 8 <= len(b):
+    n = int.from_bytes(b[i:i+4], 'big'); t = bytes(b[i+4:i+8])
+    if n == 1: n = int.from_bytes(b[i+8:i+16], 'big')
+    if n < 8 or not t.isalnum() and t != b'moov': break
+    if t == b'moov':
+        m = bytes(b[i:i+n])
+        m = m.replace(b'FFMP', b'\0\0\0\0')
+        m = re.sub(rb'(Video|Sound|Data)Handler', relleno(b'\0'), m)
+        b[i:i+n] = m
+    i += n
+
+open(p, 'wb').write(b)
+PY2
+}
+
+limpiar_ffmpeg() {  # $1 entrada  $2 salida  $3 formato (ffprobe)  $4… opciones del muxer
+  local i="$1" o="$2" f="$3"; shift 3
+  ffmpeg -nostdin -loglevel error -y -i "$i" -map 0 -map_metadata -1 -map_chapters -1 \
+    -c copy -fflags +bitexact -flags:v +bitexact -flags:a +bitexact "$@" ${f:+-f "$f"} "$o"
+}
+
+# Tipo REAL por contenido (no por la terminación): así un .jpg sin extensión, un .dat que
+# es MP3 o un PDF renombrado se limpian con el motor correcto. Si `file` sólo sabe que es
+# binario o zip, la terminación sirve de pista (mat2 deja algunos .xlsx como octet-stream).
+tipo() {  # $1 archivo → extensión canónica
+  local m e; m=$(file -b --mime-type "$1"); e=$(echo "${2:-}" | tr A-Z a-z)
+  case "$m" in
+    image/jpeg) echo jpg ;; image/png) echo png ;; image/heic|image/heif) echo heic ;;
+    image/tiff) echo tif ;; image/webp) echo webp ;; image/gif) echo gif ;; image/bmp) echo bmp ;;
+    image/avif) echo avif ;; image/jxl) echo jxl ;; image/svg+xml) echo svg ;;
+    audio/mpeg) echo mp3 ;; audio/x-wav|audio/wav) echo wav ;; audio/flac|audio/x-flac) echo flac ;;
+    audio/ogg) echo ogg ;; audio/x-aiff|audio/aiff) echo aiff ;; audio/x-m4a|audio/mp4) echo m4a ;;
+    video/mp4) echo mp4 ;; video/quicktime) echo mov ;; video/x-matroska) echo mkv ;; video/webm) echo webm ;;
+    video/x-msvideo) echo avi ;; video/3gpp) echo 3gp ;; video/x-ms-asf|video/x-ms-wmv) echo wmv ;;
+    application/pdf) echo pdf ;; application/epub+zip) echo epub ;; application/x-tar) echo tar ;;
+    *wordprocessingml*) echo docx ;; *spreadsheetml*) echo xlsx ;; *presentationml*) echo pptx ;;
+    *opendocument.text) echo odt ;; *opendocument.spreadsheet) echo ods ;; *opendocument.presentation) echo odp ;;
+    text/html) echo html ;;
+    text/*) echo txt ;;
+    application/zip) case "$e" in docx|xlsx|pptx|odt|ods|odp|epub) echo "$e" ;; *) echo zip ;; esac ;;
+    *) echo "${e:-bin}" ;;
+  esac
+}
+
+es_media() {  # $1 archivo de trabajo (x.<tipo real>): audio/video por tipo, o lo confirma ffprobe
+  case "${1##*.}" in
+    mp3|wav|flac|ogg|aiff|m4a|mp4|mov|mkv|webm|avi|3gp|wmv) return 0 ;;
+    # ffprobe ve «pistas» en PDF, fotos u Office: no son audio/video
+    pdf|docx|xlsx|pptx|odt|ods|odp|epub|zip|tar|txt|html|svg|jpg|png|heic|tif|webp|gif|bmp|avif|jxl) return 1 ;;
+  esac
+  ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$1" 2>/dev/null | grep -qE '^(audio|video)'
+}
+
+# Limpia $1 (una copia de trabajo cuya terminación ya es la del tipo real). 0 = limpiado.
+limpiar() {
+  local w="$1" k="${1##*.}" L=""; [ $LIGERO -eq 1 ] && L="-L"
+  case "$k" in
+    # Fotos: exiftool quita los bloques sin re-codificar (mat2 re-comprime el JPEG y pierde
+    # calidad). Se conserva sólo la orientación y el perfil de color, si no la foto sale girada/deslavada.
+    jpg|png|heic|tif|webp|dng)
+      exiftool -q -q -overwrite_original -all= -tagsfromfile @ -Orientation -icc_profile "$w"; return ;;
+    # Texto plano: no lleva metadatos dentro; basta con los atributos de macOS
+    txt) return 0 ;;
+    # ZIP: se abre y su contenido se blanquea con este mismo comando (zips dentro de zips
+    # incluidos; mat2 no puede con un HEIC adentro). Sin ocultos ni __MACOSX, fechas a 1980
+    # y sin atributos extra. Si algo de adentro no queda limpio, el zip entero no se entrega.
+    zip)
+      local z="$TRABAJO/zip"; rm -rf "$z"; mkdir -p "$z/c"
+      unzip -qq "$w" -d "$z/c" </dev/null || return 1       # cifrado o dañado: no se entrega
+      find "$z/c" \( -name '.*' -o -name __MACOSX \) -prune -exec rm -rf {} +
+      local opc=(--en-sitio); [ $LIGERO -eq 1 ] && opc+=(--ligero)
+      "$0" "${opc[@]}" "$z/c" > "$z/log" 2>&1 || { grep -E '^(⚠|✗)' "$z/log" | sed "s|$z/c/|    dentro del zip: |"; return 1; }
+      find "$z/c" -exec touch -h -t 198001010000 {} +
+      rm -f "$w"; (cd "$z/c" && zip -q -r -X "$w" .) ; return ;;
+    # MOV/MP4/M4A: exiftool borra la metadata (GPS, modelo, fechas…) sin re-empaquetar;
+    # pasar por ffmpeg dejaría su propia marca. Si exiftool no puede, sigue el camino de abajo.
+    mov|mp4|m4a|3gp) exiftool -q -q -overwrite_original -all= "$w" && return 0 ;;
+  esac
+  if ! mat2 $L --unknown-members omit -s "$w" 2>&1 | grep -q "not supported"; then
+    mat2 $L --unknown-members omit --inplace "$w" >/dev/null 2>&1; return
+  fi
+  # Audio/video que mat2 no conoce (o contenedor sin extensión conocida): ffmpeg sin re-codificar
+  local fmt; fmt=$(ffprobe -v error -show_entries format=format_name -of csv=p=0 "$w" 2>/dev/null | cut -d, -f1)
+  if [ -n "$fmt" ] && es_media "$w"; then
+    # El muxer sale de la terminación real; si no hay una conocida, del formato que reporta ffprobe
+    # MKV/WebM sin CRC32 por elemento: si no, el parche de firmas de abajo invalidaría los CRC
+    local x=""; case "$k" in mkv|webm) x="-write_crc32 0" ;; esac
+    { limpiar_ffmpeg "$w" "$TRABAJO/ff.$k" "" $x 2>/dev/null || limpiar_ffmpeg "$w" "$TRABAJO/ff.$k" "$fmt" $x; } \
+      && mv -f "$TRABAJO/ff.$k" "$w"; return
+  fi
+  # Cualquier otro formato que exiftool sepa escribir (PSD, EPS, AI, RAW, ...)
+  exiftool -q -q -overwrite_original -all= "$w" 2>/dev/null && return 0
+  # Nada sabe escribirlo: se deja como está y la verificación de abajo decide
+  SINMOTOR=1; return 0
+}
+
+uno() {
+  local f="$1" dir base ext out w k
+  dir=$(dirname "$f"); base=$(basename "$f"); ext="${base##*.}"
+  [[ "$base" == *.cleaned.* || "$base" == *.cleaned ]] && return 1  # salida de una corrida anterior
+  [ "$ext" = "$base" ] && ext=""
+  if [ $ENSITIO -eq 1 ]; then out="$f"
+  elif [ -n "$ext" ]; then out="$dir/${base%.*}.cleaned.${ext}"
+  else out="$dir/${base}.cleaned"; fi
+
+  k=$(tipo "$f" "$ext")
+  w="$TRABAJO/x.$k"; rm -f "$TRABAJO"/x.*; cp "$f" "$w"
+  SINMOTOR=0
+  limpiar "$w" || { echo "✗ $f  (no se pudo limpiar como $k)"; mal=$((mal+1)); return 1; }
+  es_media "$w" && neutralizar_firmas "$w"
+  xattr -c "$w" 2>/dev/null  # cuarentena, "descargado de" (kMDItemWhereFroms), etiquetas de Finder
+
+  # Medir, no suponer
+  local resto attrs
+  # exiftool no reconoce algunos MP3 que empiezan sin bloque ID3: entonces mide ffprobe.
+  # Si ninguno lo puede leer, no se da por limpio.
+  resto=$(exiftool -q -q -s -G1 "${SENSIBLES[@]}" "$w" 2>/dev/null) \
+    || resto=$(ffprobe -v error -show_entries format_tags:stream_tags -of compact=p=0 "$w" 2>/dev/null) \
+    || { [ "$SINMOTOR" = 1 ] && resto="" || resto="no se pudo leer para verificar"; }
+  # En audio/video, ffprobe además ve lo que exiftool no; y las firmas del codificador se buscan
+  # en los bytes. Etiquetas estructurales (marca del contenedor, idioma, duración) no delatan.
+  if es_media "$w"; then
+    resto="$resto
+$(ffprobe -v error -show_entries format_tags:stream_tags -of default=nw=1 "$w" 2>&1 \
+   | grep -vE '^TAG:(major_brand|minor_version|compatible_brands|language|DURATION)=|^TAG:(vendor_id=\[0\]\[0\]\[0\]\[0\]|handler_name=|encoder= *)$' \
+   | grep -vE '^TAG:(handler_name=Core Media (Video|Audio|Metadata)|vendor_id=appl)$')
+$(LC_ALL=C grep -aoE 'Lav[fc][0-9]+\.[0-9]+|LAME[0-9]|x26[45] (- core|\(build)|FFMP' "$w" | sort -u | sed 's/^/firma: /')" 
+  fi
+  # Fechas en cero y la familia del codificador sin versión (ver neutralizar_firmas) no delatan nada
+  resto=$(printf '%s\n' "$resto" | grep -vE ': 0000:00:00 00:00:00$|Encoder +: ((Lavf|Lavc|LAME)([^0-9A-Za-z].*)?)?$|^TAG:encoder=(Lavf|Lavc|LAME)$' | sed '/^$/d')
+  # com.apple.provenance lo protege macOS (no se puede borrar) y no viaja con el archivo
+  attrs=$(xattr "$w" 2>/dev/null | grep -v '^com.apple.provenance$')
+  if [ -n "$resto" ] || [ -n "$attrs" ]; then
+    echo "⚠ $f  quedó:"; printf '%s\n%s\n' "$resto" "$attrs" | sed '/^$/d;s/^/    /'; mal=$((mal+1)); return 1
+  fi
+  mv -f "$w" "$out"
+  if [ "$SINMOTOR" = 1 ]; then
+    echo "◦ $out  (formato sin motor de escritura: no se le hallaron metadatos, se copió tal cual)"; crudo=$((crudo+1))
+  else
+    echo "✓ $out"; ok=$((ok+1))
+  fi
+}
+
+for r in "${RUTAS[@]}"; do
+  if [ -d "$r" ] && [ $ENSITIO -eq 1 ]; then
+    while IFS= read -r -d '' f; do uno "$f"; done < <(find "$r" -type f ! -name '.*' -print0)
+  elif [ -d "$r" ]; then
+    # Carpeta gemela: se copia (sin ocultos como .DS_Store, sin fechas ni atributos) y se limpia
+    # en sitio. Lo que no sale ✓ se borra de la copia, para que nada sucio viaje en ella.
+    dest="${r%/} (blanqueada)"
+    [ -e "$dest" ] && { echo "✗ ya existe «${dest}»: bórrala o muévela antes"; mal=$((mal+1)); continue; }
+    # --copy-links: un enlace simbólico se entrega como archivo limpio, no como enlace al original
+    rsync -r --copy-links --exclude='.*' "${r%/}/" "$dest/"
+    ENSITIO=1
+    while IFS= read -r -d '' f; do uno "$f" || rm -f "$f"; done < <(find "$dest" -type f -print0)
+    ENSITIO=0
+    echo "→ carpeta limpia: $dest"
+  elif [ -f "$r" ]; then uno "$r"
+  else echo "✗ $r  no existe"; mal=$((mal+1)); fi
+done
+
+echo "—— limpios: $ok   sin metadatos (copiados tal cual): $crudo   con residuos/fallas: $mal"
+[ $mal -eq 0 ]

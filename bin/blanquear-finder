@@ -1,0 +1,31 @@
+#!/bin/bash
+# Lo que corre la Acción Rápida «Blanquear» del Finder (clic derecho sobre archivos o carpetas).
+# Avisa al empezar y al terminar; si algo no quedó limpio, lo lista y ofrece ver el detalle.
+# El reporte completo de la última corrida queda en ~/Library/Logs/blanquear.log
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+LOG="$HOME/Library/Logs/blanquear.log"
+
+aviso() { MSG="$1" osascript -e 'display notification (system attribute "MSG") with title "Blanquear"'; }
+
+aviso "Limpiando $# elemento(s)…"
+blanquear "$@" > "$LOG" 2>&1; rc=$?
+resumen=$(tail -1 "$LOG" | sed 's/^—— //')
+
+# Mostrar lo que se produjo: la carpeta «(blanqueada)» o el archivo .cleaned
+salida=$(sed -n 's/^→ carpeta limpia: //p' "$LOG" | head -1)
+[ -z "$salida" ] && salida=$(sed -n 's/^[✓◦] \(.*\)$/\1/p' "$LOG" | sed 's/  (formato sin motor.*$//' | head -1)
+[ -n "$salida" ] && open -R "$salida"
+
+if [ $rc -eq 0 ]; then
+  aviso "Listo. $resumen"
+else
+  problemas=$(grep -E '^(⚠|✗)' "$LOG" | sed -e 's|^✗ ya existe «.*/\([^/]*\)».*|✗ ya existe «\1»: bórrala o muévela y repite|' \
+    -e 's|^⚠ .*/\([^/]*\)  quedó:$|⚠ \1|' -e 's|^✗ .*/\([^/]*\)  (\(.*\))$|✗ \1 (\2)|' | head -12)
+  MSG="$resumen
+
+No quedaron limpios (no entran en la copia):
+$problemas" osascript \
+    -e 'set r to display dialog (system attribute "MSG") with title "Blanquear" buttons {"Ver detalle", "OK"} default button "OK" with icon caution' \
+    -e 'if button returned of r is "Ver detalle" then do shell script "open -a TextEdit " & quoted form of (POSIX path of (path to library folder from user domain) & "Logs/blanquear.log")' >/dev/null
+fi
+exit 0
