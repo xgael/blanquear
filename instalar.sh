@@ -4,7 +4,7 @@ set -euo pipefail
 AQUI=$(cd "$(dirname "$0")" && pwd)
 
 command -v brew >/dev/null || { echo "Falta Homebrew: https://brew.sh" >&2; exit 1; }
-brew install mat2 exiftool ffmpeg
+brew install mat2 exiftool ffmpeg fonttools
 
 mkdir -p "$HOME/.local/bin" "$HOME/Library/Services"
 install -m 755 "$AQUI/bin/blanquear" "$AQUI/bin/blanquear-finder" "$HOME/.local/bin/"
