@@ -2,13 +2,39 @@
 # Lo que corre la Acción Rápida «Blanquear» del Finder (clic derecho sobre archivos o carpetas).
 # Avisa al empezar y al terminar; si algo no quedó limpio, lo lista y ofrece ver el detalle.
 # El reporte completo de la última corrida queda en ~/Library/Logs/blanquear.log
+export LC_ALL=C  # con es_MX.UTF-8, grep no halla ✓ ⚠ ✗ (medido: 0 contra 151)
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 LOG="$HOME/Library/Logs/blanquear.log"
 
 aviso() { MSG="$1" osascript -e 'display notification (system attribute "MSG") with title "Blanquear"'; }
 
-aviso "Limpiando $# elemento(s)…"
-blanquear "$@" > "$LOG" 2>&1; rc=$?
+EST="$HOME/Library/Caches/blanquear-progreso"   # lo lee la ventana de progreso (progreso.applescript)
+# ponytail: un solo archivo de estado; dos corridas a la vez comparten ventana. Por corrida si hace falta.
+VENTANA="$HOME/Library/Application Support/blanquear/Blanquear.app"
+
+total=0
+for r in "$@"; do
+  if [ -d "$r" ]; then total=$((total + $(find -L "$r" -type f ! -path '*/.*' | wc -l))); else total=$((total + 1)); fi
+done
+rm -f "$EST.cancelado"
+blanquear "$@" > "$LOG" 2>&1 & bpid=$!
+printf '0\t%s\t%s\t\n' "$total" "$bpid" > "$EST"
+if [ -d "$VENTANA" ]; then open -a "$VENTANA"; else aviso "Limpiando $total archivo(s)…"; fi
+# Cada archivo procesado deja una línea ✓ ◦ ⚠ ✗ en el reporte
+while kill -0 $bpid 2>/dev/null; do
+  hechos=$(grep -cE '^(✓|◦|⚠|✗) ' "$LOG")
+  ultimo=$(grep -E '^(✓|◦|⚠|✗) ' "$LOG" | tail -1 | sed -e 's/  quedó:$//' -e 's/  (.*$//' -e 's|.*/||')
+  printf '%s\t%s\t%s\t%s\n' "$hechos" "$total" "$bpid" "$ultimo" > "$EST.tmp" && mv "$EST.tmp" "$EST"
+  sleep 0.5
+done
+wait $bpid; rc=$?
+echo fin > "$EST"
+
+if [ -e "$EST.cancelado" ]; then
+  rm -f "$EST.cancelado"
+  aviso "Detenido. $(grep -cE '^(✓|◦) ' "$LOG") de $total quedaron limpios; si se creó una carpeta «(blanqueada)», está incompleta: bórrala antes de repetir."
+  exit 0
+fi
 resumen=$(tail -1 "$LOG" | sed 's/^—— //')
 
 # Mostrar lo que se produjo: la carpeta «(blanqueada)» o el archivo .cleaned

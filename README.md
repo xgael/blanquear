@@ -10,7 +10,7 @@ blanquear ~/Desktop/Mi\ carpeta    # → «Mi carpeta (blanqueada)» al lado, mi
 ```
 
 O en el Finder: clic derecho sobre archivos o carpetas → **Acciones rápidas → Blanquear**.
-Avisa al terminar y muestra el resultado; el reporte queda en `~/Library/Logs/blanquear.log`.
+Una ventana muestra la barra con el porcentaje, cuántos archivos van y cuál se está limpiando (con botón **Detener**); al terminar avisa y muestra el resultado; el reporte queda en `~/Library/Logs/blanquear.log`.
 
 ## Qué hace
 
