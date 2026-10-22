@@ -56,6 +56,7 @@ check "el zip cifrado no entra en la copia" '[ ! -e "$O/cifrado.zip" ]'
 check "un archivo ilegible no deja copia sucia en el destino" '[ ! -e "$O/ilegible.jpg" ]'
 check "el .DS_Store no entra en la copia" '[ ! -e "$O/.DS_Store" ]'
 check "todo lo demás sí entra" '[ $(find "$O" -type f | wc -l) -eq $(find "$T/C" -type f ! -name ".*" ! -name cifrado.zip ! -name ilegible.jpg | wc -l) ]'
+check "cada ✓/◦ del reporte existe en disco" '! sed -n "s/^[✓◦] \(.*\)$/\1/p" "$T/log" | sed "s/  (formato sin motor.*$//" | while IFS= read -r f; do [ -e "$f" ] || echo "$f"; done | grep -q .'
 check "mismas carpetas (incluida la vacía)" 'diff <(cd "$T/C" && find . -type d | sort) <(cd "$O" && find . -type d | sort) >/dev/null'
 check "original intacto" '[ "$(md5 -q "$T/C/foto.jpg")" = "$(cat "$T/md5")" ]'
 check "tipos reales conservados (pdf llamado .jpg, docx sin extensión)" \
@@ -99,6 +100,16 @@ for r in "nivel 2/nivel 3/clip" "nivel 2/nivel 3/v.mkv" "nivel 2/nivel 3/nivel 4
 done
 check "audio/video decodificado idéntico cuadro por cuadro" '[ $iguales -eq 1 ]'
 check "foto idéntica en píxeles" '[ "$(ffmpeg -nostdin -i "$T/C/foto.jpg" -i "$O/foto.jpg" -lavfi ssim -f null - 2>&1 | grep -o "All:[0-9.]*")" = "All:1.000000" ]'
+
+echo "Destino renombrado a media corrida…"
+R="$T/R"; mkdir -p "$R"; for i in $(seq 1 30); do cp "$T/fx/g.ttf" "$R/g$i.ttf"; done
+"$B" "$R" > "$T/logR" 2>&1 & pid=$!
+until [ -n "$(ls "$R (blanqueada)" 2>/dev/null)" ] || ! kill -0 $pid 2>/dev/null; do sleep 0.1; done
+mv "$R (blanqueada)" "$T/R renombrada"; wait $pid; rcR=$?
+check "termina con error" '[ $rcR -ne 0 ]'
+check "avisa que el destino desapareció" 'grep -q "desapareció a media corrida" "$T/logR"'
+check "ningún ✓ apunta a un archivo que no existe" '! sed -n "s/^✓ \(.*\)$/\1/p" "$T/logR" | sed "s|$R (blanqueada)|$T/R renombrada|" | while IFS= read -r f; do [ -e "$f" ] || echo "$f"; done | grep -q .'
+check "no imprime «carpeta limpia» de una carpeta que ya no existe" '! grep -q "^→ carpeta limpia" "$T/logR"'
 
 echo; [ $fallas -eq 0 ] && echo "TODO BIEN" || echo "$fallas comprobación(es) fallaron"
 exit $fallas

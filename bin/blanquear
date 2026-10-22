@@ -290,7 +290,8 @@ $(fuente "$w" --verificar 2>&1)"; resto=$(printf '%s\n' "$resto" | sed '/^$/d') 
   if [ -n "$resto" ] || [ -n "$attrs" ]; then
     echo "⚠ $f  quedó:"; printf '%s\n%s\n' "$resto" "$attrs" | sed '/^$/d;s/^/    /'; mal=$((mal+1)); return 1
   fi
-  mv -f "$w" "$out"
+  # Sin comprobar, un destino renombrado a media corrida dio ✓ a 911 archivos que nunca llegaron
+  mv -f "$w" "$out" 2>/dev/null || { echo "✗ $f  (no se pudo escribir en $out)"; mal=$((mal+1)); return 1; }
   if [ "$SINMOTOR" = 1 ]; then
     echo "◦ $out  (formato sin motor de escritura: no se le hallaron metadatos, se copió tal cual)"; crudo=$((crudo+1))
   else
@@ -311,6 +312,7 @@ for r in "${RUTAS[@]}"; do
     mkdir "$dest" 2>/dev/null || { echo "✗ ya existe «${dest}»: bórrala o muévela antes"; mal=$((mal+1)); continue; }
     (cd "$src" && find -L . -type d ! -path '*/.*' -print0) | while IFS= read -r -d '' d; do mkdir -p "$dest/$d"; done
     while IFS= read -r -d '' rel; do
+      [ -d "$dest" ] || { echo "✗ «${dest}» desapareció a media corrida (¿se renombró o movió?): corrida detenida, repítela"; mal=$((mal+1)); continue 2; }
       uno "$src/${rel#./}" "$dest/${rel#./}"
     done < <(cd "$src" && find -L . -type f ! -path '*/.*' -print0)
     echo "→ carpeta limpia: $dest"
