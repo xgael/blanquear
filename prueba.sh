@@ -102,7 +102,7 @@ check "audio/video decodificado idéntico cuadro por cuadro" '[ $iguales -eq 1 ]
 check "foto idéntica en píxeles" '[ "$(ffmpeg -nostdin -i "$T/C/foto.jpg" -i "$O/foto.jpg" -lavfi ssim -f null - 2>&1 | grep -o "All:[0-9.]*")" = "All:1.000000" ]'
 
 echo "Destino renombrado a media corrida…"
-R="$T/R"; mkdir -p "$R"; for i in $(seq 1 30); do cp "$T/fx/g.ttf" "$R/g$i.ttf"; done
+R="$T/R"; mkdir -p "$R"; for i in $(seq 1 200); do cp "$T/fx/g.ttf" "$R/g$i.ttf"; done
 "$B" "$R" > "$T/logR" 2>&1 & pid=$!
 until [ -n "$(ls "$R (blanqueada)" 2>/dev/null)" ] || ! kill -0 $pid 2>/dev/null; do sleep 0.1; done
 mv "$R (blanqueada)" "$T/R renombrada"; wait $pid; rcR=$?

@@ -21,6 +21,8 @@ Una ventana muestra la barra con el porcentaje, cuántos archivos van y cuál se
 | `--en-sitio` | sobrescribe los originales (sin respaldo) |
 | `--ligero` | PDF con texto seleccionable (por defecto cada página se vuelve imagen: lo único que garantiza un PDF vacío) |
 
+Las carpetas se procesan en paralelo, un archivo por núcleo (1369 fuentes: 317 s → 76 s en 8 núcleos, misma salida byte a byte).
+
 El tipo se reconoce por el **contenido**, no por la terminación: una foto sin extensión o un
 PDF llamado `.jpg` se limpian con el motor correcto y conservan su nombre.
 

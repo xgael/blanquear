@@ -20,21 +20,26 @@
 set -uo pipefail
 export LC_ALL=C  # se procesan bytes binarios; con UTF-8, sed/grep fallan con «illegal byte sequence»
 
-ENSITIO=0; LIGERO=0; RUTAS=()
+ENSITIO=0; LIGERO=0; UNO=0; RUTAS=()
 for a in "$@"; do
   case "$a" in
     --en-sitio) ENSITIO=1 ;;
     --ligero)   LIGERO=1 ;;
+    --uno)      UNO=1 ;;   # interno: un trabajador de carpeta (RAÍZ_ORIGEN RAÍZ_DESTINO RUTA_RELATIVA)
     -h|--help)  sed -n '2,18p' "$0"; exit 0 ;;
     *)          RUTAS+=("$a") ;;
   esac
 done
 [ ${#RUTAS[@]} -eq 0 ] && { sed -n '2,18p' "$0"; exit 1; }
-for t in mat2 exiftool ffmpeg; do
-  command -v $t >/dev/null || { echo "falta $t: brew install $t" >&2; exit 1; }
-done
-FT_PY="$(brew --prefix fonttools 2>/dev/null)/libexec/bin/python"   # fontTools + brotli (WOFF2)
-[ -x "$FT_PY" ] || { echo "falta fonttools: brew install fonttools" >&2; exit 1; }
+if [ -z "${FT_PY:-}" ]; then   # los trabajadores lo heredan ya comprobado
+  for t in mat2 exiftool ffmpeg; do
+    command -v $t >/dev/null || { echo "falta $t: brew install $t" >&2; exit 1; }
+  done
+  FT_PY="$(brew --prefix fonttools 2>/dev/null)/libexec/bin/python"   # fontTools + brotli (WOFF2)
+  [ -x "$FT_PY" ] || { echo "falta fonttools: brew install fonttools" >&2; exit 1; }
+  export FT_PY
+fi
+HILOS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)   # un archivo por núcleo
 
 # Etiquetas que delatan origen/persona/lugar. Las estructurales (ancho, códec…) no cuentan.
 SENSIBLES=(-GPS:all -Make -Model -SerialNumber -InternalSerialNumber -LensModel -LensSerialNumber
@@ -299,9 +304,29 @@ $(fuente "$w" --verificar 2>&1)"; resto=$(printf '%s\n' "$resto" | sed '/^$/d') 
   fi
 }
 
+# Trabajador: limpia un archivo de una carpeta. Imprime todo de una sola escritura para que
+# las líneas de trabajadores en paralelo no se intercalen. Si la carpeta destino desapareció
+# (renombrada a media corrida), sale con 255 y xargs deja de lanzar trabajadores.
+if [ $UNO -eq 1 ]; then
+  [ -d "${RUTAS[1]}" ] || { echo "✗ «${RUTAS[1]}» desapareció a media corrida (¿se renombró o movió?): corrida detenida, repítela"; exit 255; }
+  rel="${RUTAS[2]#./}"; o=$(uno "${RUTAS[0]}/$rel" "${RUTAS[1]}/$rel"); rc=$?
+  printf '%s\n' "$o"; exit $rc
+fi
+
+# Una carpeta en paralelo (un trabajador por núcleo). Los conteos salen del reporte.
+carpeta() {  # $1 origen  $2 destino (= origen en sitio)
+  local opc=() rep="$TRABAJO/reporte"; [ $ENSITIO -eq 1 ] && opc+=(--en-sitio); [ $LIGERO -eq 1 ] && opc+=(--ligero)
+  : > "$rep"
+  (cd "$1" && find -L . -type f ! -path '*/.*' -print0) \
+    | xargs -0 -n1 -P "$HILOS" "$0" ${opc[@]+"${opc[@]}"} --uno "$1" "$2" | tee "$rep"
+  ok=$((ok + $(grep -c '^✓ ' "$rep"))); crudo=$((crudo + $(grep -c '^◦ ' "$rep")))
+  mal=$((mal + $(grep -cE '^(⚠|✗) ' "$rep")))
+  [ -d "$2" ]   # 1 = el destino desapareció
+}
+
 for r in "${RUTAS[@]}"; do
   if [ -d "$r" ] && [ $ENSITIO -eq 1 ]; then
-    while IFS= read -r -d '' rel; do uno "${r%/}/${rel#./}"; done < <(cd "$r" && find . -type f ! -path '*/.*' -print0)
+    carpeta "${r%/}" "${r%/}"
   elif [ -d "$r" ]; then
     # Carpeta gemela «(blanqueada)»: cada archivo se limpia en una carpeta de trabajo aparte y
     # SÓLO entra al destino si salió verificado; nada sucio llega a existir ahí (antes se copiaba
@@ -311,11 +336,7 @@ for r in "${RUTAS[@]}"; do
     # mkdir sin -p es atómico: si dos corridas arrancan a la vez, sólo una gana
     mkdir "$dest" 2>/dev/null || { echo "✗ ya existe «${dest}»: bórrala o muévela antes"; mal=$((mal+1)); continue; }
     (cd "$src" && find -L . -type d ! -path '*/.*' -print0) | while IFS= read -r -d '' d; do mkdir -p "$dest/$d"; done
-    while IFS= read -r -d '' rel; do
-      [ -d "$dest" ] || { echo "✗ «${dest}» desapareció a media corrida (¿se renombró o movió?): corrida detenida, repítela"; mal=$((mal+1)); continue 2; }
-      uno "$src/${rel#./}" "$dest/${rel#./}"
-    done < <(cd "$src" && find -L . -type f ! -path '*/.*' -print0)
-    echo "→ carpeta limpia: $dest"
+    carpeta "$src" "$dest" && echo "→ carpeta limpia: $dest"
   elif [ -f "$r" ]; then uno "$r"
   else echo "✗ $r  no existe"; mal=$((mal+1)); fi
 done
